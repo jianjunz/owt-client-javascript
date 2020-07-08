@@ -1,0 +1,50 @@
+<!--
+ Copyright (C) <2020> Intel Corporation
+
+ SPDX-License-Identifier: Apache-2.0
+-->
+
+<html>
+<meta charset="utf-8">
+
+<head>
+  <title>Open WebRTC Toolkit QUIC Sample</title>
+  <style>
+    html {
+      font-family: "intel-clear", "tahoma", Helvetica, "helvetica", Arial, sans-serif;
+      font-size: 90%;
+    }
+
+    .operations {
+      padding: 1em 0;
+    }
+
+    #gaming-video {
+      display: none;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>Open WebRTC Toolkit</h1>
+  <h2>Sample of QuicTransport</h2>
+  <div id="description">
+    <p>This sample works with the latest Chrome.</p>
+  </div>
+  <div class="operations">
+    <button id="start-streaming">Start streaming</button>
+  </div>
+  <div id="videocontainer">
+    <div id="remote">
+      <h2>RemoteView</h2>
+      <video id="gaming-video" width="640px" height="480px" id="remoteVideo" playsinline muted controls></video>
+    </div>
+  </div>
+  <div id="conference-status"></div>
+  <div class="stats">
+  </div>
+  <script src="scripts/quic.js" type="text/javascript"></script>
+  <script src="scripts/jmuxer.js" type="text/javascript"></script>
+</body>
+
+</html>
