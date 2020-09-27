@@ -8,9 +8,9 @@ let quicTransport = null;
 let sendStream = null;
 let writeTask;
 let sourceBuffer
-let jmuxter;
 let audioDecoder;
 let audioContext;
+let videoDecoder;
 
 const audioDecoderConfig = {
   codec: "opus",
@@ -18,8 +18,13 @@ const audioDecoderConfig = {
   numberOfChannels: 2
 };
 
+const videoDecoderConfig={
+  codec:'avc1.64000c',
+  description:new ArrayBuffer(2)
+};
+
 function updateStatus(message) {
-  document.getElementById('conference-status').innerHTML +=
+  document.getElementById('gaming-status').innerHTML +=
       ('<p>' + message + '</p>');
 }
 
@@ -95,7 +100,7 @@ async function onIncomingStream(stream) {
           frame.set(
               data.slice(readSize, readSize + remainFrameSize), frameSizeUsed);
           if (streamType == 3) {  // Video.
-            jmuxter.feed({video: frame, duration: 0});
+            videoDecoder.decode(new EncodedVideoChunk({data: frame}));
           } else if (streamType == 2) {  // Audio.
             audioDecoder.decode(new EncodedAudioChunk(
                 {data: frame}));
@@ -154,8 +159,8 @@ async function createSendChannel() {
 
 async function windowOnLoad() {
   //prepareMediaSource();
-  initJmuxer();
   initAudio();
+  initVideo();
   //sendStream = await quicTransport.createSendStream();
 }
 
@@ -169,21 +174,17 @@ async function writeData() {
   return;
 }
 
-function initJmuxer() {
-  jmuxter = new JMuxer({
-    node: 'gaming-video',
-    mode: 'video',
-    fps: 60,
-    flushingTime: 1,
-    debug: false
-  });
-}
-
 function initAudio() {
   audioDecoder =
       new AudioDecoder({output: audioDecoderOutput, error: audioDecoderError});
   audioDecoder.configure(audioDecoderConfig);
-audioContext=new AudioContext();
+  audioContext = new AudioContext();
+}
+
+function initVideo() {
+  videoDecoder =
+      new VideoDecoder({output: videoDecoderOutput, error: videoDecoderError});
+  videoDecoder.configure(videoDecoderConfig);
 }
 
 function prepareMediaSource() {
@@ -219,7 +220,6 @@ function prepareMediaSource() {
 }
 
 function audioDecoderOutput(audioFrame) {
-  console.log('Decoder output. ' + audioFrame.buffer.length);
   const soundSource = audioContext.createBufferSource();
   soundSource.buffer = audioFrame.buffer;
   soundSource.connect(audioContext.destination);
@@ -227,7 +227,17 @@ function audioDecoderOutput(audioFrame) {
 }
 
 function audioDecoderError(error){
-  console.log('Failed to decode. '+error);
+  console.log('Audio decoder failed to decode. '+error);
+}
+
+function videoDecoderOutput(videoFrame){
+  const canvas = document.getElementById('gaming-video');
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(videoFrame);
+}
+
+function videoDecoderError(error){
+  console.log('Video decoder failed to decode. '+error);
 }
 
 window.addEventListener('load', () => {
@@ -235,8 +245,7 @@ window.addEventListener('load', () => {
 });
 
 document.getElementById('start-streaming').addEventListener('click', () => {
-  const gamingVideoElement = document.getElementById('gaming-video');
-  gamingVideoElement.play();
-  gamingVideoElement.style.display = 'block';
+  const gamingCanvasElement = document.getElementById('gaming-video');
+  gamingCanvasElement.style.display = 'block';
   createSendChannel();
 });
