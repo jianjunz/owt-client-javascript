@@ -6,7 +6,7 @@
 /* eslint-disable valid-jsdoc */
 /* eslint-disable require-jsdoc */
 /* global Event, Map, Promise, RTCIceCandidate, RTCSessionDescription,
-   RTCPeerConnection, navigator */
+   RTCPeerConnection, navigator, setTimeout */
 
 'use strict';
 
@@ -94,6 +94,8 @@ class P2PPeerConnectionChannel extends EventDispatcher {
     this._isCaller = true;
     this._infoSent = false;
     this._disposed = false;
+    this._receivedRemoteSrflxCandidates = false;
+    this._localCandidates = [];
     this._createPeerConnection();
     if (isInitializer) {
       this._sendSignalingMessage(SignalingType.CLOSED);
@@ -450,16 +452,27 @@ class P2PPeerConnectionChannel extends EventDispatcher {
 
   _onLocalIceCandidate(event) {
     if (event.candidate) {
-      this._sendSdp({
-        type: 'candidates',
-        candidate: event.candidate.candidate,
-        sdpMid: event.candidate.sdpMid,
-        sdpMLineIndex: event.candidate.sdpMLineIndex,
-      }).catch((e)=>{
-        Logger.warning('Failed to send candidate.');
-      });
+      if (this._receivedRemoteSrflxCandidates) {
+        this._sendSdp({
+          type: 'candidates',
+          candidate: event.candidate.candidate,
+          sdpMid: event.candidate.sdpMid,
+          sdpMLineIndex: event.candidate.sdpMLineIndex,
+        }).catch((e) => {
+          Logger.warning('Failed to send candidate.');
+        });
+      } else {
+        this._localCandidates.push(event.candidate);
+      }
     } else {
       Logger.debug('Empty candidate.');
+    }
+
+    if (!this._receivedRemoteSrflxCandidates) {
+      setTimeout(() => {
+        this._receivedRemoteSrflxCandidates = true;
+        this._drainPendingLocalCandidates();
+      }, 5000);
     }
   }
 
@@ -558,6 +571,10 @@ class P2PPeerConnectionChannel extends EventDispatcher {
       sdpMid: candidateInfo.sdpMid,
       sdpMLineIndex: candidateInfo.sdpMLineIndex,
     });
+    if (candidate.type === 'srflx') {
+      this._receivedRemoteSrflxCandidates = true;
+      this._drainPendingLocalCandidates();
+    }
     if (this._pc.remoteDescription && this._pc.remoteDescription.sdp !== '') {
       Logger.debug('Add remote ice candidates.');
       this._pc.addIceCandidate(candidate).catch((error) => {
@@ -571,8 +588,8 @@ class P2PPeerConnectionChannel extends EventDispatcher {
 
   _onSignalingStateChange(event) {
     Logger.debug('Signaling state changed: ' + this._pc.signalingState);
-    if (this._pc.signalingState === 'have-remote-offer' ||
-        this._pc.signalingState === 'stable') {
+    if ((this._pc.signalingState === 'have-remote-offer' ||
+         this._pc.signalingState === 'stable')) {
       this._drainPendingRemoteIceCandidates();
     }
     if (this._pc.signalingState === 'stable') {
@@ -707,6 +724,20 @@ class P2PPeerConnectionChannel extends EventDispatcher {
       }
       bindEventsToDataChannel(event.channel, peer);
     };*/
+  }
+
+  _drainPendingLocalCandidates() {
+    for (const candidate of this._localCandidates) {
+      this._sendSdp({
+        type: 'candidates',
+        candidate: candidate.candidate,
+        sdpMid: candidate.sdpMid,
+        sdpMLineIndex: candidate.sdpMLineIndex,
+      }).catch((e) => {
+        Logger.warning('Failed to send candidate.');
+      });
+    }
+    this._localCandidates = [];
   }
 
   _drainPendingStreams() {
