@@ -4,6 +4,10 @@
 
 'use strict';
 
+importScripts('./h264_annex_b_to_avcc_converter.js')
+
+const annexbConverter = new H264AnnexBToAVCCConverter();
+
 let quicTransport = null;
 let sendStream = null;
 let writeTask;
@@ -11,29 +15,29 @@ let sourceBuffer
 let audioDecoder;
 let audioContext;
 let videoDecoder;
+let canvas;
+
+onmessage =
+    (message) => {
+      const type = message.data[0];
+      if (type === 'init') {
+        canvas = message.data[1].canvas;
+        createSendChannel();
+      }
+    }
 
 const audioDecoderConfig = {
-  codec: "opus",
+  codec: 'opus',
   sampleRate: 48000,
   numberOfChannels: 2
 };
 
-const videoDecoderConfig={
-  codec:'avc1.64000c',
-  description:new ArrayBuffer(2)
-};
-
-function updateStatus(message) {
-  document.getElementById('gaming-status').innerHTML +=
-      ('<p>' + message + '</p>');
-}
-
 async function createQuicTransport() {
-  quicTransport = new QuicTransport('quic-transport://localhost:7700/echo', {
+  quicTransport = new WebTransport('quic-transport://10.239.10.117:7700/echo', {
     serverCertificateFingerprints: [{
       algorithm: 'sha-256',
       value:
-          '85:EA:AC:A3:91:37:95:6C:19:87:E4:78:F4:CD:4A:CA:08:F7:D7:CB:70:BF:9B:EB:E0:38:0E:DB:03:A7:C7:96'
+          '75:E6:AB:44:32:04:40:DC:1D:17:FB:BA:97:86:6D:2C:F6:7E:8C:F4:76:09:DC:73:D2:BD:8E:E2:18:0D:7F:78'
     }]
   });
   quicTransport.onstatechange = () => {
@@ -44,7 +48,8 @@ async function createQuicTransport() {
 }
 
 async function receiveStreams() {
-  const receiveStreamReader = quicTransport.receiveStreams().getReader();
+  const receiveStreamReader =
+      quicTransport.incomingBidirectionalStreams.getReader();
   console.info('Reader: ' + receiveStreamReader);
   let receivingDone = false;
   while (!receivingDone) {
@@ -69,13 +74,15 @@ async function onIncomingStream(stream) {
   let remainFrameSize = 0;
   let nextFrameLengthArray = new Uint8Array(8);
   let nextFrameLengthArrayRead = 0;
+  let firstAudioFrame=false;
   while (!readingDone) {
     const {value: data, done: readingChunksDone} = await chunkReader.read();
     if (readingChunksDone) {
       readingDone = true;
       return;
     }
-    //console.log('Received size: '+data.length+', remainFrameSize: '+remainFrameSize+', frameSizeUsed: '+frameSizeUsed);
+    // console.log('Received size: '+data.length+', remainFrameSize:
+    // '+remainFrameSize+', frameSizeUsed: '+frameSizeUsed);
     let readSize = 0;
     if (!streamType) {
       // TODO: Read the first 8 bytes for stream type.
@@ -83,15 +90,20 @@ async function onIncomingStream(stream) {
         log.error('No enough data for stream type.')
         return;
       }
+      let printBytes = '';
+      for (let i = 0; i < 8; i++) {
+        printBytes += (data[i] + ' ');
+      }
+      console.log(printBytes);
       streamType = data[7];
-      console.info('Stream type: '+streamType);
+      console.info('Stream type: ' + streamType);
       readSize = 8;
     }
     while (readSize < data.length) {
       if (remainFrameSize != 0) {
         if (data.length - readSize < remainFrameSize) {
           // Read all data to frame.
-          const readNow=data.length - readSize;
+          const readNow = data.length - readSize;
           frame.set(data.slice(readSize), frameSizeUsed);
           frameSizeUsed += readNow;
           remainFrameSize -= readNow;
@@ -100,10 +112,25 @@ async function onIncomingStream(stream) {
           frame.set(
               data.slice(readSize, readSize + remainFrameSize), frameSizeUsed);
           if (streamType == 3) {  // Video.
-            videoDecoder.decode(new EncodedVideoChunk({data: frame}));
+            const extraData = annexbConverter.GetHeader(frame);
+            let frameType = 'delta';
+            if (!videoDecoder) {
+              initVideo(extraData);
+              frameType = 'key';
+            }
+            videoDecoder.decode(new EncodedVideoChunk({
+              timestamp: Date.now(),
+              data: annexbConverter.ConvertTrunk(frame),
+              type: frameType
+            }));
           } else if (streamType == 2) {  // Audio.
-            audioDecoder.decode(new EncodedAudioChunk(
-                {data: frame}));
+            let frameType='delta';
+            if(firstAudioFrame){
+              frameType='key';
+              firstAudioFrame=false;
+            }
+            audioDecoder.decode(
+                new EncodedAudioChunk({timestamp: Date.now(), data: frame, type:frameType}));
           }
           readSize += remainFrameSize;
           remainFrameSize = 0;
@@ -118,12 +145,12 @@ async function onIncomingStream(stream) {
               data.slice(readSize, readSize + readNow),
               nextFrameLengthArrayRead);
           nextFrameLengthArrayRead += readNow;
-          readSize+=readNow;
+          readSize += readNow;
         } else if (data.length < readSize + 8) {
           nextFrameLengthArray.set(
               data.slice(readSize, readSize + data.length));
           nextFrameLengthArrayRead = data.length - readSize;
-          readSize=data.length;
+          readSize = data.length;
         } else {
           nextFrameLengthArray.set(data.slice(readSize, readSize + 8));
           nextFrameLengthArrayRead = 8;
@@ -137,13 +164,14 @@ async function onIncomingStream(stream) {
         for (let i = 7; i >= 0; i--) {
           remainFrameSize += nextFrameLengthArray[i] * Math.pow(256, 8 - i - 1);
         }
-        // console.log('Frame size: ' + remainFrameSize+', time: '+performance.timing.navigationStart + performance.now());
+        // console.log('Frame size: ' + remainFrameSize+', time:
+        // '+performance.timing.navigationStart + performance.now());
         nextFrameLengthArrayRead = 0;
         frame = new Uint8Array(remainFrameSize);
       }
     }
 
-    //console.log('Read data: ' + data);
+    // console.log('Read data: ' + data);
     // if (!sourceBuffer.updating) {
     //   sourceBuffer.appendBuffer(data);
     //   console.log('appended.');
@@ -153,15 +181,16 @@ async function onIncomingStream(stream) {
 }
 
 async function createSendChannel() {
+  initAudio();
   await createQuicTransport();
-  updateStatus('Created QUIC transport.');
+  // updateStatus('Created QUIC transport.');
 }
 
 async function windowOnLoad() {
-  //prepareMediaSource();
-  initAudio();
-  initVideo();
-  //sendStream = await quicTransport.createSendStream();
+  // prepareMediaSource();
+  // initAudio();
+  // initVideo();
+  // sendStream = await quicTransport.createSendStream();
 }
 
 async function writeData() {
@@ -178,74 +207,47 @@ function initAudio() {
   audioDecoder =
       new AudioDecoder({output: audioDecoderOutput, error: audioDecoderError});
   audioDecoder.configure(audioDecoderConfig);
-  audioContext = new AudioContext();
 }
 
-function initVideo() {
+function initVideo(avccExtraData) {
+  const videoDecoderConfig = {codec: 'avc1.42400a', description: avccExtraData};
   videoDecoder =
       new VideoDecoder({output: videoDecoderOutput, error: videoDecoderError});
   videoDecoder.configure(videoDecoderConfig);
 }
 
-function prepareMediaSource() {
-  var vidElement = document.querySelector('video');
-  vidElement.addEventListener('error',(e)=>{
-    console.log('Video element error: '+JSON.stringify(e));
-  });
-
-  if (window.MediaSource) {
-    var mediaSource = new MediaSource();
-    vidElement.src = URL.createObjectURL(mediaSource);
-    mediaSource.addEventListener('sourceopen', sourceOpen);
-    mediaSource.addEventListener('error', (e) => {
-      console.error('Error: ' + e);
-    });
-  } else {
-    console.log('The Media Source Extensions API is not supported.')
-  }
-
-  function sourceOpen(e) {
-    URL.revokeObjectURL(vidElement.src);
-    var mime = 'video/mp4; codecs="avc1.42E01E"';
-    var mediaSource = e.target;
-    sourceBuffer = mediaSource.addSourceBuffer(mime);
-    sourceBuffer.addEventListener('updateend', () => {
-      return;
-      if (bufferQueue.length) {
-        sourceBuffer.appendBuffer(bufferQueue.shift());
-        console.log('appended.');
-      }
-    })
-  }
-}
-
 function audioDecoderOutput(audioFrame) {
-  const soundSource = audioContext.createBufferSource();
-  soundSource.buffer = audioFrame.buffer;
-  soundSource.connect(audioContext.destination);
-  soundSource.start(0);
+  const audioBuffer = {
+    numberOfChannels: audioFrame.buffer.numberOfChannels,
+    sampleRate: audioFrame.buffer.sampleRate,
+    length: audioFrame.buffer.length,
+    duration: audioFrame.buffer.duration,
+    channelData: []
+  };
+  for (let i = 0; i < audioFrame.buffer.numberOfChannels; i++) {
+    audioBuffer.channelData.push(audioFrame.buffer.getChannelData(i));
+  }
+  postMessage(['audio-frame', audioBuffer]);
 }
 
-function audioDecoderError(error){
-  console.log('Audio decoder failed to decode. '+error);
+function audioDecoderError(error) {
+  console.log('Audio decoder failed to decode. ' + error);
 }
 
-function videoDecoderOutput(videoFrame){
-  const canvas = document.getElementById('gaming-video');
+async function videoDecoderOutput(videoFrame) {
+  drawFrame(videoFrame);
+  videoFrame.close();
+}
+
+function videoDecoderError(error) {
+  console.log('Video decoder failed to decode. ' + error);
+}
+
+async function drawFrame(videoFrame) {
   const ctx = canvas.getContext('2d');
-  ctx.drawImage(videoFrame);
+  const image = await videoFrame.createImageBitmap();
+  ctx.canvas.width = image.width;
+  ctx.canvas.height = image.height;
+  // Observed flickering on macOS if FPS is large (>24).
+  ctx.drawImage(image, 0, 0, image.width, image.height);
 }
-
-function videoDecoderError(error){
-  console.log('Video decoder failed to decode. '+error);
-}
-
-window.addEventListener('load', () => {
-  windowOnLoad();
-});
-
-document.getElementById('start-streaming').addEventListener('click', () => {
-  const gamingCanvasElement = document.getElementById('gaming-video');
-  gamingCanvasElement.style.display = 'block';
-  createSendChannel();
-});
