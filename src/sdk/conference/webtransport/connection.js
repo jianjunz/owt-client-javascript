@@ -49,7 +49,10 @@ export class QuicConnection extends EventDispatcher {
     this._initReceiveStreamReader();
     this._worker = new Worker(workerDir + '/media-worker.js', {type: 'module'});
     this._initHandlersForWorker();
-    // Key is subscription ID, value is a MediaStreamTrackGenerator writer.
+    // Key is subscription ID, value is a MediaStreamTrackGenerator
+    // writer/writable. When a WT stream is piped to a writable, its writer
+    // should be removed to avoid holding the lock.
+    this._mstAudioGeneratorWriters = new Map();
     this._mstVideoGeneratorWriters = new Map();
     this._initRtpModule();
     this._initDatagramReader();
@@ -110,11 +113,11 @@ export class QuicConnection extends EventDispatcher {
       }
       // Use BYOB reader when it's supported to avoid copy. See
       // https://github.com/w3c/webtransport/issues/131. Issue tracker:
-      // https://crbug.com/1182905.
+      // https://crbug.com/1259886.
       const chunkReader = receiveStream.readable.getReader();
       const readingChunksDone = false;
       let readingHeaderDone = false;
-      let mediaStream = false;
+      let isMediaStream = false;
       let subscriptionId;
       while (!readingChunksDone && !readingHeaderDone) {
         const {value, done: readingChunksDone} = await chunkReader.read();
@@ -133,6 +136,7 @@ export class QuicConnection extends EventDispatcher {
           }
           subscriptionId =
               this._uint8ArrayToUuid(new Uint8Array(subscriptionIdBytes));
+          Logger.debug(`Subscription ID: ${subscriptionId}.`);
           if (!this._subscribeOptions.has(subscriptionId)) {
             Logger.debug('Subscribe options is not ready.');
             const p = new Promise((resolve) => {
@@ -143,9 +147,9 @@ export class QuicConnection extends EventDispatcher {
           }
           const subscribeOptions = this._subscribeOptions.get(subscriptionId);
           if (subscribeOptions.audio || subscribeOptions.video) {
-            mediaStream = true;
+            isMediaStream = true;
           }
-          if (!mediaStream) {
+          if (!isMediaStream) {
             readingHeaderDone = true;
             if (copyLength < value.byteLength) {
               Logger.warning(
@@ -171,10 +175,18 @@ export class QuicConnection extends EventDispatcher {
           Logger.debug(`WebTransport stream for subscription ID ${
             subscriptionId} and track ID ${
             trackId} is ready to receive data.`);
+          readingHeaderDone = true;
+          if (valueOffset < value.byteLength) {
+            this._worker.postMessage(
+                ['bitstream-chunk', [trackId, value.slice(valueOffset)]]);
+          }
+          chunkReader.releaseLock();
+          this._bindMediaChunkReader(trackId, receiveStream);
+          continue;
         }
         if (readingChunksDone) {
           Logger.error('Stream closed unexpectedly.');
-          return;
+          continue;
         }
       }
       chunkReader.releaseLock();
@@ -183,6 +195,18 @@ export class QuicConnection extends EventDispatcher {
         const subscription =
             this._createSubscription(subscriptionId, receiveStream);
         this._subscribePromises.get(subscriptionId).resolve(subscription);
+      }
+    }
+  }
+
+  async _bindMediaChunkReader(trackId, stream) {
+    const chunkReader = stream.readable.getReader();
+    let readDone = false;
+    while (!readDone) {
+      const {value, done} = await chunkReader.read();
+      this._worker.postMessage(['bitstream-chunk', [trackId, value]]);
+      if (done) {
+        readDone = true;
       }
     }
   }
@@ -518,8 +542,15 @@ export class QuicConnection extends EventDispatcher {
                     new MediaStreamTrackGenerator({kind: track.type});
                 generators.push(generator);
                 // TODO: Update key with the correct SSRC.
-                this._mstVideoGeneratorWriters.set(
-                    data.id, generator.writable.getWriter());
+                if (track.type === 'audio') {
+                  this._mstAudioGeneratorWriters.set(
+                      data.id, generator.writable.getWriter());
+                } else if (track.type === 'video') {
+                  this._mstVideoGeneratorWriters.set(
+                      data.id, generator.writable.getWriter());
+                } else {
+                  Logger.warning(`Unrecognized track type: ${track.type}.`);
+                }
               }
               const mediaStream = new MediaStream(generators);
               const subscription =
@@ -615,6 +646,9 @@ export class QuicConnection extends EventDispatcher {
     this._worker.onmessage = ((e) => {
       const [command, args] = e.data;
       switch (command) {
+        case 'audio-frame':
+          this._mstAudioGeneratorWriters.get(args[0]).write(args[1]);
+          break;
         case 'video-frame':
           this._mstVideoGeneratorWriters.get(args[0]).write(args[1]);
           break;

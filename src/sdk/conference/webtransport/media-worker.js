@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /* eslint-disable require-jsdoc */
-/* global AudioEncoder, VideoEncoder, VideoDecoder, Map, ArrayBuffer,
-   Uint8Array, DataView, console, EncodedVideoChunk, postMessage */
+/* global AudioEncoder, VideoEncoder, AudioDecoder, VideoDecoder, Map,
+   ArrayBuffer, Uint8Array, DataView, console, EncodedVideoChunk, postMessage */
 
 // TODO: Use relative path instead.
 import initModule from '/src/samples/conference/public/scripts/owt.js';
@@ -17,14 +17,27 @@ const writers = new Map();
 // for its video track.
 const keyFrameRequested = new Map();
 
+// TODO: Audio track ID and video track ID are hard coded at this time.
+const audioTrackId = '00000000000000000000000000000001';
+const videoTrackId = '00000000000000000000000000000002';
+
 let wasmModule;
 let mediaSession;
 // Key is SSRC, value is an RTP receiver.
 const rtpReceivers = new Map();
 let frameBuffer;
+let audioDecoder;
 let videoDecoder;
 // 4 bytes for frame size before each frame. The 1st byte is reserved, always 0.
 const sizePrefix = 4;
+
+// When downlink is reliable, use following variables to construct frames from
+// trunks.
+let receiveHeaderOffset = 0;
+let receiveHeaderBuffer = new ArrayBuffer(4);
+let receiveFrameBuffer;
+let receiveFrameBufferCapacity = 0;
+let receiveFrameBufferOffset = 0;
 
 // Timestamp of the first frame.
 let startTime = 0;
@@ -49,6 +62,9 @@ onmessage = async (e) => {
       break;
     case 'rtp-packet':
       await handleRtpPacket(args);
+      break;
+    case 'bitstream-chunk':
+      await handleBitstreamBuffer(...args);
       break;
     case 'add-subscription':
       addNewSubscription(...args);
@@ -157,12 +173,28 @@ function initVideoEncoder(config, writer) {
   return videoEncoder;
 }
 
+function initAudioDecoder(subscriptionId) {
+  audioDecoder = new AudioDecoder({
+    output: audioFrameOutputCallback.bind(null, subscriptionId),
+    error: webCodecsErrorCallback,
+  });
+  // TODO: Configure audio decoder based on sender settings.
+  audioDecoder.configure(
+      {codec: 'opus', sampleRate: 44800, numberOfChannels: 2});
+}
+
 function initVideoDecoder(subscriptionId) {
   videoDecoder = new VideoDecoder({
     output: videoFrameOutputCallback.bind(null, subscriptionId),
     error: webCodecsErrorCallback,
   });
   videoDecoder.configure({codec: 'avc1.42400a', optimizeForLatency: true});
+}
+
+function audioFrameOutputCallback(subscriptionId, frame) {
+  // eslint-disable-next-line no-undef
+  postMessage(['audio-frame', [subscriptionId, frame]], [frame]);
+  frame.close();
 }
 
 function videoFrameOutputCallback(subscriptionId, frame) {
@@ -201,6 +233,71 @@ function getSsrc(packet) {
   return new DataView(packet.buffer).getUint32(8, false);
 }
 
+function decodeFrame(trackId, frameBuffer, frameType) {
+  if (startTime === 0) {
+    startTime = Date.now() * 1000;
+  }
+  if (trackId === audioTrackId) {
+    audioDecoder.decode(new EncodedAudioChunk({
+      timestamp: Date.now() * 1000 - startTime,
+      data: frameBuffer,
+      type: frameType,
+    }));
+  } else if (trackId === videoTrackId) {
+    videoDecoder.decode(new EncodedVideoChunk({
+      timestamp: Date.now() * 1000 - startTime,
+      data: frameBuffer,
+      type: frameType,
+    }));
+  } else {
+    console.warn('Unknown track ID.');
+  }
+}
+
+async function handleBitstreamBuffer(trackId, chunk) {
+  let readOffset = 0;
+  while (readOffset < chunk.byteLength) {
+    if (receiveHeaderOffset < 4) {
+      // Read header.
+      const readBytes =
+          Math.min(chunk.byteLength - readOffset, 4 - receiveHeaderOffset);
+      new Uint8Array(receiveHeaderBuffer)
+          .set(
+              chunk.slice(readOffset, readOffset + readBytes),
+              receiveHeaderOffset);
+      receiveHeaderOffset += readBytes;
+      readOffset += readBytes;
+      // Create enough space for the next frame.
+      if (receiveHeaderOffset === 4) {
+        const newFrameSize =
+            new DataView(receiveHeaderBuffer).getUint32(0, false);
+        receiveFrameBufferOffset = 0;
+        if (receiveFrameBufferCapacity < newFrameSize) {
+          receiveFrameBuffer = new ArrayBuffer(newFrameSize);
+          receiveFrameBufferCapacity = newFrameSize;
+        }
+      }
+    }
+    const frameSize = new DataView(receiveHeaderBuffer).getUint32(0, false);
+    if (receiveHeaderOffset < frameSize) {
+      const readBytes = Math.min(
+          chunk.byteLength - readOffset, frameSize - receiveFrameBufferOffset);
+      new Uint8Array(receiveFrameBuffer)
+          .set(
+              chunk.slice(readOffset, readOffset + readBytes),
+              receiveFrameBufferOffset);
+      receiveFrameBufferOffset += readBytes;
+      readOffset += readBytes;
+      if (receiveFrameBufferOffset === frameSize) {
+        // Complete frame.
+        decodeFrame(receiveFrameBuffer, 'key');  // TODO: Not always key frames.
+        // Prepare for the next frame.
+        receiveHeaderOffset = 0;
+      }
+    }
+  }
+}
+
 async function handleRtpPacket(packet) {
   const ssrc = getSsrc(packet);
   const buffer = wasmModule._malloc(packet.byteLength);
@@ -213,8 +310,14 @@ async function handleRtpPacket(packet) {
 }
 
 function addNewSubscription(subscriptionId, subscribeOptions, rtpConfig) {
-  // TODO: Audio is not supported yet, ignore the audio part.
+  initAudioDecoder(subscriptionId);
   initVideoDecoder(subscriptionId);
+  if (!rtpConfig || !rtpConfig.video) {
+    // No RTP config usually means media data is received through reliable
+    // WebTransport stream. Thus, no RTP module is required.
+    // TODO: Make sure using rtpConfig to determine reliableness is robust.
+    return;
+  }
   const videoSsrc = rtpConfig.video.ssrc;
   if (rtpReceivers.has(videoSsrc)) {
     console.error(`RTP receiver for SSRC ${videoSsrc} exits.`);
@@ -230,13 +333,6 @@ function addNewSubscription(subscriptionId, subscribeOptions, rtpConfig) {
   const rtpReceiver = mediaSession.createRtpVideoReceiver(videoSsrc);
   rtpReceivers.set(videoSsrc, rtpReceiver);
   rtpReceiver.setCompleteFrameCallback((frame, isKeyFrame) => {
-    if (startTime === 0) {
-      startTime = Date.now()*1000;
-    }
-    videoDecoder.decode(new EncodedVideoChunk({
-      timestamp: Date.now() * 1000 - startTime,
-      data: frame,
-      type: isKeyFrame ? 'key' : 'delta',
-    }));
+    decodeFrame(frame, isKeyFrame ? 'key' : 'delta');
   });
 }
