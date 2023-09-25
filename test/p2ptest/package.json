@@ -25,6 +25,12 @@
   "overrides": {
     "karma-coverage": {
       "istanbul-lib-instrument": "^6.0.0"
+    },
+    "jasmine-node": {
+      "underscore": "^1.12.1",
+      "jasmine-growl-reporter": {
+        "growl": "1.10.0"
+      }
     }
   }
 }
